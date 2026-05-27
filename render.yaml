@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: intrusion-detection-system
+    env: python
+    plan: starter
+    repo: https://github.com/Alkaaaa11/intrusion-detection-system
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run intrusion-detection-system/app.py --server.port $PORT --server.headless true
+    envVars:
+      - key: STREAMLIT_SERVER_ENABLECORS
+        value: "false"
