@@ -39,8 +39,15 @@ Thumbs.db
 
 # Local project artifacts
 models/*.pkl
+models/*.txt
+models/*.csv
 charts/*.png
 data/*.csv
+data/*.txt
+dataset/*.csv
+dataset/*.txt
+logs/*.csv
+reports/*.csv
 
 # Streamlit cache
 .streamlit/
@@ -50,7 +57,15 @@ __pycache__/
 *.pyc
 .DS_Store
 
-data/
-models/
+!data/
+!data/.gitkeep
+!dataset/
+!dataset/.gitkeep
+!models/
+!models/.gitkeep
+!logs/
+!logs/.gitkeep
+!reports/
+!reports/.gitkeep
 
 .env

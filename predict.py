@@ -63,6 +63,17 @@ def load_sample_data(sample_data_path: Path, sample_size: int = 5) -> pd.DataFra
     return sample_df
 
 
+def resolve_sample_data_path() -> Path:
+    """
+    Prefer data/, but allow dataset/ if preprocessing was run there.
+    """
+    candidates = [Path("data/processed_test.csv"), Path("dataset/processed_test.csv")]
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
+
+
 def decode_attack_types(predictions, label_encoder: Optional[object]):
     """
     Convert numeric class ids to readable attack type names (if encoder is available).
@@ -119,7 +130,7 @@ def run_prediction_pipeline() -> None:
     try:
         model_path = Path("models/intrusion_model.pkl")
         encoder_path = Path("models/label_encoder.pkl")
-        sample_data_path = Path("data/processed_test.csv")
+        sample_data_path = resolve_sample_data_path()
 
         model, label_encoder = load_model_and_encoder(model_path, encoder_path)
         sample_df = load_sample_data(sample_data_path, sample_size=5)

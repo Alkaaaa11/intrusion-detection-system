@@ -26,6 +26,17 @@ def ensure_charts_dir(charts_dir: Path) -> None:
     charts_dir.mkdir(parents=True, exist_ok=True)
 
 
+def resolve_processed_test_path() -> Path:
+    """
+    Prefer data/, but allow dataset/ if preprocessing was run there.
+    """
+    candidates = [Path("data/processed_test.csv"), Path("dataset/processed_test.csv")]
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
+
+
 def plot_attack_distribution(data: pd.DataFrame, label_column: str, charts_dir: Path) -> None:
     """
     Create a bar chart showing count of each attack category.
@@ -64,6 +75,28 @@ def plot_confusion_matrix_heatmap(
     cm = confusion_matrix(y_true, y_pred)
     cm_df = pd.DataFrame(cm, index=class_names, columns=class_names)
 
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm_df, annot=True, fmt="d", cmap="Blues", cbar=True)
+    plt.title("Confusion Matrix Heatmap", fontsize=14)
+    plt.xlabel("Predicted Label", fontsize=12)
+    plt.ylabel("True Label", fontsize=12)
+    plt.tight_layout()
+
+    output_path = charts_dir / "confusion_matrix_heatmap.png"
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+    print(f"[INFO] Saved chart: {output_path}")
+
+
+def plot_saved_confusion_matrix(matrix_path: Path, charts_dir: Path) -> None:
+    """
+    Plot a confusion matrix produced by train_model.py.
+    """
+    if not matrix_path.exists():
+        print("[INFO] Real confusion matrix report not found. Run train_model.py first to create it.")
+        return
+
+    cm_df = pd.read_csv(matrix_path, index_col=0)
     plt.figure(figsize=(8, 6))
     sns.heatmap(cm_df, annot=True, fmt="d", cmap="Blues", cbar=True)
     plt.title("Confusion Matrix Heatmap", fontsize=14)
@@ -147,9 +180,9 @@ def run_visualization_pipeline() -> None:
     Example pipeline that reads processed test data and generates charts.
     """
     try:
-        data_dir = Path("data")
         charts_dir = Path("charts")
-        processed_test_path = data_dir / "processed_test.csv"
+        reports_dir = Path("reports")
+        processed_test_path = resolve_processed_test_path()
 
         ensure_charts_dir(charts_dir)
 
@@ -169,20 +202,15 @@ def run_visualization_pipeline() -> None:
         plot_attack_distribution(test_df, label_column, charts_dir)
         plot_normal_vs_attack(test_df, label_column, charts_dir)
 
-        # Demo accuracy comparison values (replace with real results if available).
-        demo_scores = {
-            "RandomForest": 0.92,
-            "DecisionTree": 0.88,
-            "LogisticRegression": 0.84,
-        }
-        plot_model_accuracy_comparison(demo_scores, charts_dir)
+        score_path = Path("models/model_scores.csv")
+        if score_path.exists():
+            scores_df = pd.read_csv(score_path)
+            if {"model_name", "accuracy"}.issubset(scores_df.columns):
+                plot_model_accuracy_comparison(dict(zip(scores_df["model_name"], scores_df["accuracy"])), charts_dir)
+        else:
+            print("[INFO] Model score table not found. Run train_model.py first for accuracy comparison.")
 
-        # Demo confusion matrix generated from example predictions.
-        # This keeps the script runnable even before full prediction integration.
-        y_true_demo = test_df[label_column].head(500)
-        y_pred_demo = y_true_demo.copy()  # perfect demo prediction
-        class_names = sorted(y_true_demo.astype(str).unique())
-        plot_confusion_matrix_heatmap(y_true_demo, y_pred_demo, class_names, charts_dir)
+        plot_saved_confusion_matrix(reports_dir / "confusion_matrix.csv", charts_dir)
 
         print("[INFO] All visualization charts generated successfully.")
 

@@ -18,6 +18,7 @@ from typing import Dict, Tuple
 import joblib
 import matplotlib.pyplot as plt
 import pandas as pd
+import seaborn as sns
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
@@ -42,6 +43,20 @@ def load_processed_data(
     print(f"[INFO] Train data shape: {train_df.shape}")
     print(f"[INFO] Test data shape: {test_df.shape}")
     return train_df, test_df
+
+
+def resolve_processed_paths() -> Tuple[Path, Path]:
+    """
+    Prefer data/, but allow dataset/ if preprocessing was run there.
+    """
+    candidates = [
+        (Path("data/processed_train.csv"), Path("data/processed_test.csv")),
+        (Path("dataset/processed_train.csv"), Path("dataset/processed_test.csv")),
+    ]
+    for train_path, test_path in candidates:
+        if train_path.exists() and test_path.exists():
+            return train_path, test_path
+    return candidates[0]
 
 
 def split_features_and_target(
@@ -188,6 +203,8 @@ def evaluate_model(
     X_test: pd.DataFrame,
     y_test_encoded: pd.Series,
     label_encoder: LabelEncoder,
+    reports_dir: Path,
+    confusion_chart_path: Path,
 ) -> None:
     """
     Evaluate the model and print beginner-friendly metrics.
@@ -214,6 +231,33 @@ def evaluate_model(
     cm_df = pd.DataFrame(cm, index=label_encoder.classes_, columns=label_encoder.classes_)
     print(cm_df)
     print("======================================\n")
+
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    report_dict = classification_report(
+        y_test_encoded,
+        y_pred,
+        target_names=label_encoder.classes_,
+        zero_division=0,
+        output_dict=True,
+    )
+    report_df = pd.DataFrame(report_dict).transpose()
+    report_path = reports_dir / "classification_report.csv"
+    matrix_path = reports_dir / "confusion_matrix.csv"
+    report_df.to_csv(report_path)
+    cm_df.to_csv(matrix_path)
+    print(f"[INFO] Classification report saved to: {report_path}")
+    print(f"[INFO] Confusion matrix CSV saved to: {matrix_path}")
+
+    confusion_chart_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm_df, annot=True, fmt="d", cmap="Blues", cbar=True)
+    plt.title(f"Confusion Matrix - {model_name}")
+    plt.xlabel("Predicted Label")
+    plt.ylabel("True Label")
+    plt.tight_layout()
+    plt.savefig(confusion_chart_path, dpi=300)
+    plt.close()
+    print(f"[INFO] Confusion matrix chart saved to: {confusion_chart_path}")
 
 
 def save_accuracy_comparison_chart(model_scores: Dict[str, float], chart_path: Path) -> None:
@@ -247,6 +291,38 @@ def save_accuracy_comparison_chart(model_scores: Dict[str, float], chart_path: P
     plt.savefig(chart_path, dpi=300)
     plt.close()
     print(f"[INFO] Accuracy comparison chart saved to: {chart_path}")
+
+
+def save_feature_importance_chart(model: object, feature_names, chart_path: Path, report_path: Path) -> None:
+    """
+    Save feature importance for tree-based models.
+    """
+    if not hasattr(model, "feature_importances_"):
+        print("[INFO] Best model does not expose feature_importances_; skipping feature importance chart.")
+        return
+
+    chart_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    importance_df = pd.DataFrame(
+        {
+            "feature": list(feature_names),
+            "importance": model.feature_importances_,
+        }
+    ).sort_values(by="importance", ascending=False)
+    importance_df.to_csv(report_path, index=False)
+
+    top_features = importance_df.head(15).sort_values(by="importance", ascending=True)
+    plt.figure(figsize=(9, 7))
+    plt.barh(top_features["feature"], top_features["importance"], color="#38bdf8")
+    plt.title("Top Feature Importance")
+    plt.xlabel("Importance")
+    plt.ylabel("Feature")
+    plt.tight_layout()
+    plt.savefig(chart_path, dpi=300)
+    plt.close()
+    print(f"[INFO] Feature importance report saved to: {report_path}")
+    print(f"[INFO] Feature importance chart saved to: {chart_path}")
 
 
 def save_artifacts(
@@ -298,24 +374,50 @@ def run_training_pipeline() -> None:
     Main training pipeline function.
     """
     try:
-        train_path = Path("data/processed_train.csv")
-        test_path = Path("data/processed_test.csv")
+        train_path, test_path = resolve_processed_paths()
         model_path = Path("models/intrusion_model.pkl")
         label_encoder_path = Path("models/label_encoder.pkl")
         scaler_path = Path("models/scaler_info.txt")
         score_path = Path("models/model_scores.csv")
+        reports_dir = Path("reports")
         comparison_chart_path = Path("charts/model_accuracy_comparison.png")
+        confusion_chart_path = Path("charts/confusion_matrix_heatmap.png")
+        feature_importance_chart_path = Path("charts/feature_importance.png")
+        feature_importance_report_path = Path("reports/feature_importance.csv")
 
         train_df, test_df = load_processed_data(train_path, test_path)
         X_train, y_train, X_test, y_test = split_features_and_target(train_df, test_df)
         X_train, X_test = ensure_numeric_features(X_train, X_test)
         y_train_encoded, y_test_encoded, label_encoder = encode_target_labels(y_train, y_test)
 
+        # For a demo-friendly beginner/medium presentation, train a binary detector
+        # that separates 'normal' from 'malicious' (all other attack categories).
+        # This improves clarity for interviews and avoids sparse multi-class issues.
+        print("[INFO] Converting target to binary labels for demo (normal vs malicious)...")
+        y_train_binary = y_train.astype(str).apply(lambda x: "normal" if x.lower() == "normal" else "malicious")
+        y_test_binary = y_test.astype(str).apply(lambda x: "normal" if x.lower() == "normal" else "malicious")
+
+        y_train_encoded, y_test_encoded, label_encoder = encode_target_labels(y_train_binary, y_test_binary)
+
         best_model_name, best_model, model_scores = compare_models(
             X_train, y_train_encoded, X_test, y_test_encoded
         )
         save_accuracy_comparison_chart(model_scores, comparison_chart_path)
-        evaluate_model(best_model, best_model_name, X_test, y_test_encoded, label_encoder)
+        evaluate_model(
+            best_model,
+            best_model_name,
+            X_test,
+            y_test_encoded,
+            label_encoder,
+            reports_dir,
+            confusion_chart_path,
+        )
+        save_feature_importance_chart(
+            best_model,
+            X_train.columns,
+            feature_importance_chart_path,
+            feature_importance_report_path,
+        )
         save_artifacts(
             best_model,
             best_model_name,

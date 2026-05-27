@@ -17,6 +17,7 @@ What this script does:
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import joblib
 import pandas as pd
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
@@ -131,14 +132,17 @@ def load_dataset(file_path: Path) -> pd.DataFrame:
         # - encoding issues
         # - malformed rows
         # - tokenizing errors
+        # NSL-KDD can be comma-separated or tab-separated depending on the mirror.
+        # Use a regex separator so both formats are parsed correctly.
         data = pd.read_csv(
             file_path,
             header=None,
             names=NSL_KDD_COLUMNS,
-            sep=",",
+            sep=r"[\t,]+",
             encoding="latin1",
             engine="python",
             on_bad_lines="skip",
+            skipinitialspace=True,
         )
 
         if data.empty:
@@ -270,12 +274,58 @@ def save_processed_data(train_data: pd.DataFrame, test_data: pd.DataFrame, data_
     print(f"[INFO] Saved processed test data to: {processed_test_path}")
 
 
+def save_preprocessing_artifacts(
+    encoders: Dict[str, LabelEncoder],
+    scaler: StandardScaler,
+    feature_columns: List[str],
+    categorical_columns: List[str],
+    numerical_columns: List[str],
+    models_dir: Path = Path("models"),
+) -> None:
+    """
+    Save preprocessing objects so prediction uses the same transformations as training.
+    """
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    artifact = {
+        "categorical_encoders": encoders,
+        "scaler": scaler,
+        "feature_columns": feature_columns,
+        "categorical_columns": categorical_columns,
+        "numerical_columns": numerical_columns,
+        "target_column": "attack_category",
+        "label_column": "label",
+    }
+    artifact_path = models_dir / "preprocessing_artifacts.pkl"
+    joblib.dump(artifact, artifact_path)
+    print(f"[INFO] Preprocessing artifacts saved to: {artifact_path}")
+
+
+def resolve_data_dir(preferred_dir: Path = Path("data")) -> Path:
+    """
+    Prefer data/, but allow dataset/ for checklist-friendly project layouts.
+    """
+    train_name = "KDDTrain+.txt"
+    test_name = "KDDTest+.txt"
+
+    if (preferred_dir / train_name).exists() and (preferred_dir / test_name).exists():
+        return preferred_dir
+
+    alternate_dir = Path("dataset")
+    if (alternate_dir / train_name).exists() and (alternate_dir / test_name).exists():
+        print("[INFO] Using dataset/ because raw NSL-KDD files were found there.")
+        return alternate_dir
+
+    return preferred_dir
+
+
 def preprocess_nsl_kdd(data_dir: Path = Path("data")) -> None:
     """
     Main preprocessing workflow for NSL-KDD.
     """
     try:
         print("[INFO] Starting NSL-KDD preprocessing...")
+        data_dir = resolve_data_dir(data_dir)
 
         train_path = data_dir / "KDDTrain+.txt"
         test_path = data_dir / "KDDTest+.txt"
@@ -293,7 +343,7 @@ def preprocess_nsl_kdd(data_dir: Path = Path("data")) -> None:
         # Categorical features (not targets).
         categorical_columns = ["protocol_type", "service", "flag"]
 
-        train_df, test_df, _ = encode_categorical_columns(
+        train_df, test_df, encoders = encode_categorical_columns(
             train_df, test_df, categorical_columns
         )
 
@@ -303,7 +353,7 @@ def preprocess_nsl_kdd(data_dir: Path = Path("data")) -> None:
             col for col in train_df.columns if col not in excluded_columns and col not in categorical_columns
         ]
 
-        train_df, test_df, _ = scale_numerical_columns(
+        train_df, test_df, scaler = scale_numerical_columns(
             train_df, test_df, numerical_columns
         )
 
@@ -315,6 +365,13 @@ def preprocess_nsl_kdd(data_dir: Path = Path("data")) -> None:
         print(f"[INFO] Test features shape: {X_test.shape}, Test labels shape: {y_test.shape}")
 
         save_processed_data(train_df, test_df, data_dir)
+        save_preprocessing_artifacts(
+            encoders=encoders,
+            scaler=scaler,
+            feature_columns=list(X_train.drop(columns=["label"], errors="ignore").columns),
+            categorical_columns=categorical_columns,
+            numerical_columns=numerical_columns,
+        )
         print("[INFO] Preprocessing completed successfully.")
 
     except FileNotFoundError as file_error:

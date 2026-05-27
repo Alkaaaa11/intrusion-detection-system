@@ -27,9 +27,60 @@ import pandas as pd
 import seaborn as sns
 import streamlit as st
 
-MODEL_PATH = Path("models/intrusion_model.pkl")
-LABEL_ENCODER_PATH = Path("models/label_encoder.pkl")
-MODEL_SCORES_PATH = Path("models/model_scores.csv")
+BASE_DIR = Path(__file__).resolve().parent
+
+# Resolve resource paths relative to the app file directory so the app works
+# regardless of the current working directory used to launch Streamlit.
+MODEL_PATH = BASE_DIR / "models" / "intrusion_model.pkl"
+LABEL_ENCODER_PATH = BASE_DIR / "models" / "label_encoder.pkl"
+MODEL_SCORES_PATH = BASE_DIR / "models" / "model_scores.csv"
+PREPROCESSING_ARTIFACTS_PATH = BASE_DIR / "models" / "preprocessing_artifacts.pkl"
+ATTACK_LOG_PATH = BASE_DIR / "logs" / "attack_history.csv"
+LATEST_REPORT_PATH = BASE_DIR / "reports" / "latest_threat_report.csv"
+
+MANUAL_INPUT_DEFAULTS = {
+    "duration": 0,
+    "protocol_type": "tcp",
+    "service": "http",
+    "flag": "SF",
+    "src_bytes": 181,
+    "dst_bytes": 5450,
+    "land": 0,
+    "wrong_fragment": 0,
+    "urgent": 0,
+    "hot": 0,
+    "num_failed_logins": 0,
+    "logged_in": 1,
+    "num_compromised": 0,
+    "root_shell": 0,
+    "su_attempted": 0,
+    "num_root": 0,
+    "num_file_creations": 0,
+    "num_shells": 0,
+    "num_access_files": 0,
+    "num_outbound_cmds": 0,
+    "is_host_login": 0,
+    "is_guest_login": 0,
+    "count": 8,
+    "srv_count": 8,
+    "serror_rate": 0.0,
+    "srv_serror_rate": 0.0,
+    "rerror_rate": 0.0,
+    "srv_rerror_rate": 0.0,
+    "same_srv_rate": 1.0,
+    "diff_srv_rate": 0.0,
+    "srv_diff_host_rate": 0.0,
+    "dst_host_count": 9,
+    "dst_host_srv_count": 9,
+    "dst_host_same_srv_rate": 1.0,
+    "dst_host_diff_srv_rate": 0.0,
+    "dst_host_same_src_port_rate": 0.11,
+    "dst_host_srv_diff_host_rate": 0.0,
+    "dst_host_serror_rate": 0.0,
+    "dst_host_srv_serror_rate": 0.0,
+    "dst_host_rerror_rate": 0.0,
+    "dst_host_srv_rerror_rate": 0.0,
+}
 
 
 def apply_theme_css() -> None:
@@ -169,6 +220,19 @@ def load_model_artifacts(
     return model, label_encoder
 
 
+@st.cache_resource
+def load_preprocessing_artifacts(path: Path = PREPROCESSING_ARTIFACTS_PATH) -> Optional[dict]:
+    """
+    Load saved preprocessing artifacts created by preprocessing.py.
+    """
+    if not path.exists():
+        return None
+    try:
+        return joblib.load(path)
+    except Exception:
+        return None
+
+
 def load_detection_accuracy() -> Optional[float]:
     """
     Try to read best accuracy from models/model_scores.csv.
@@ -230,6 +294,41 @@ def format_timestamp(ts: Optional[datetime] = None) -> str:
     return ts.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def transform_with_saved_preprocessing(df: pd.DataFrame, artifacts: dict) -> pd.DataFrame:
+    """
+    Apply saved encoders/scaler to raw or partially raw network traffic rows.
+    """
+    prepared = df.copy()
+    prepared = prepared.drop(columns=["attack_category", "label", "difficulty_level"], errors="ignore")
+
+    for col in artifacts.get("feature_columns", []):
+        if col not in prepared.columns:
+            prepared[col] = MANUAL_INPUT_DEFAULTS.get(col, 0)
+
+    for col, encoder in artifacts.get("categorical_encoders", {}).items():
+        if col not in prepared.columns:
+            prepared[col] = MANUAL_INPUT_DEFAULTS.get(col, "")
+        values = prepared[col].astype(str)
+        known_classes = set(encoder.classes_)
+        fallback = str(encoder.classes_[0]) if len(encoder.classes_) else ""
+        safe_values = values.apply(lambda value: value if value in known_classes else fallback)
+        prepared[col] = encoder.transform(safe_values)
+
+    numerical_columns = [col for col in artifacts.get("numerical_columns", []) if col in prepared.columns]
+    for col in numerical_columns:
+        prepared[col] = pd.to_numeric(prepared[col], errors="coerce").fillna(0)
+
+    scaler = artifacts.get("scaler")
+    if scaler is not None and numerical_columns:
+        prepared[numerical_columns] = scaler.transform(prepared[numerical_columns])
+
+    feature_columns = artifacts.get("feature_columns", [])
+    if feature_columns:
+        prepared = prepared.reindex(columns=feature_columns, fill_value=0)
+
+    return prepared
+
+
 def align_and_clean_uploaded_df(uploaded_df: pd.DataFrame, model) -> pd.DataFrame:
     """
     Prepare uploaded data to match the trained model's expected numeric features.
@@ -238,6 +337,13 @@ def align_and_clean_uploaded_df(uploaded_df: pd.DataFrame, model) -> pd.DataFram
     - This dashboard expects *feature-like* CSV data (ideally from preprocessing).
     - If your file contains non-numeric strings in feature columns, they will become 0.
     """
+    artifacts = load_preprocessing_artifacts()
+    if artifacts is not None:
+        try:
+            return transform_with_saved_preprocessing(uploaded_df, artifacts)
+        except Exception as error:
+            st.warning(f"Saved preprocessing could not be applied, using numeric fallback: {error}")
+
     df = uploaded_df.copy()
 
     # Remove possible label columns if the user uploads a labeled dataset.
@@ -255,6 +361,36 @@ def align_and_clean_uploaded_df(uploaded_df: pd.DataFrame, model) -> pd.DataFram
     # Replace NaN values created by coercion.
     df = df.fillna(0)
     return df
+
+
+def save_prediction_logs(result_df: pd.DataFrame, metrics: Dict[str, object], source: str) -> None:
+    """
+    Persist prediction history and a latest summary report as CSV files.
+    """
+    ATTACK_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LATEST_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    timestamp = format_timestamp()
+    log_df = result_df.copy()
+    log_df.insert(0, "timestamp", timestamp)
+    log_df.insert(1, "source", source)
+    log_df["severity"] = metrics["threat_severity"]
+    log_df.to_csv(ATTACK_LOG_PATH, mode="a", header=not ATTACK_LOG_PATH.exists(), index=False)
+
+    summary_df = pd.DataFrame(
+        [
+            {
+                "timestamp": timestamp,
+                "source": source,
+                "total_traffic": metrics["total_traffic"],
+                "normal_count": metrics["normal_count"],
+                "malicious_count": metrics["malicious_count"],
+                "malicious_ratio": metrics["malicious_ratio"],
+                "threat_severity": metrics["threat_severity"],
+            }
+        ]
+    )
+    summary_df.to_csv(LATEST_REPORT_PATH, index=False)
 
 
 def run_predictions(prepared_df: pd.DataFrame, model, label_encoder: Optional[object]) -> pd.DataFrame:
@@ -910,6 +1046,44 @@ def render_upload_section() -> Optional[pd.DataFrame]:
         return None
 
 
+def render_manual_input_section() -> Optional[pd.DataFrame]:
+    """
+    Render a compact manual traffic form and return one raw traffic row.
+    """
+    st.subheader("Manual Traffic Prediction")
+    st.write("Enter a single network traffic sample. Unshown NSL-KDD fields use safe defaults.")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        duration = st.number_input("Duration", min_value=0, value=int(MANUAL_INPUT_DEFAULTS["duration"]))
+        protocol_type = st.selectbox("Protocol", ["tcp", "udp", "icmp"], index=0)
+        service = st.selectbox("Service", ["http", "private", "domain_u", "smtp", "ftp_data", "eco_i"], index=0)
+    with c2:
+        flag = st.selectbox("Flag", ["SF", "S0", "REJ", "RSTR", "RSTO"], index=0)
+        src_bytes = st.number_input("Source bytes", min_value=0, value=int(MANUAL_INPUT_DEFAULTS["src_bytes"]))
+        dst_bytes = st.number_input("Destination bytes", min_value=0, value=int(MANUAL_INPUT_DEFAULTS["dst_bytes"]))
+    with c3:
+        count = st.number_input("Connection count", min_value=0, value=int(MANUAL_INPUT_DEFAULTS["count"]))
+        srv_count = st.number_input("Service count", min_value=0, value=int(MANUAL_INPUT_DEFAULTS["srv_count"]))
+        same_srv_rate = st.slider("Same service rate", min_value=0.0, max_value=1.0, value=float(MANUAL_INPUT_DEFAULTS["same_srv_rate"]))
+
+    row = MANUAL_INPUT_DEFAULTS.copy()
+    row.update(
+        {
+            "duration": duration,
+            "protocol_type": protocol_type,
+            "service": service,
+            "flag": flag,
+            "src_bytes": src_bytes,
+            "dst_bytes": dst_bytes,
+            "count": count,
+            "srv_count": srv_count,
+            "same_srv_rate": same_srv_rate,
+        }
+    )
+    return pd.DataFrame([row])
+
+
 def show_loading_and_predict(uploaded_df: pd.DataFrame, model, label_encoder: Optional[object]) -> Tuple[pd.DataFrame, Dict[str, object]]:
     """
     Show loading states and run the prediction pipeline.
@@ -944,6 +1118,14 @@ def show_loading_and_predict(uploaded_df: pd.DataFrame, model, label_encoder: Op
     return result_df, metrics
 
 
+def show_saved_log_paths() -> None:
+    """
+    Show where local logs/reports were written.
+    """
+    st.caption(f"Saved attack history: {ATTACK_LOG_PATH}")
+    st.caption(f"Saved latest report: {LATEST_REPORT_PATH}")
+
+
 def show_footer() -> None:
     """
     Render a clean professional footer.
@@ -956,7 +1138,7 @@ def show_footer() -> None:
             Cybersecurity ML • Powered by Machine Learning • Built with Python + Scikit-learn + Streamlit
           </div>
           <div style="color:rgba(148,163,184,0.95);margin-top:6px;">
-            Creator: Your Name Here
+            Creator: Aakarsh Kumar
           </div>
         </div>
         """,
@@ -977,6 +1159,7 @@ def main() -> None:
     # Sidebar navigation with icons (minimal and professional).
     st.sidebar.title("Navigation")
     page_display_to_key = {
+        "Manual Prediction": "Manual Prediction",
         "🛡️ Dashboard": "Dashboard",
         "🔎 Threat Analysis": "Threat Analysis",
         "📄 Predictions": "Predictions",
@@ -1014,10 +1197,12 @@ def main() -> None:
         if st.button("Run Intrusion Detection", type="primary"):
             with st.spinner("Running AI analysis..."):
                 result_df, metrics = show_loading_and_predict(uploaded_df, model, label_encoder)
+                save_prediction_logs(result_df, metrics, source="dashboard_upload")
 
             # Metrics + alerts + summaries
             st.subheader("Security Metrics")
             styled_metrics_cards(metrics, detection_accuracy)
+            show_saved_log_paths()
             show_realtime_alert_banner(metrics)
             build_attack_summary_cards(result_df)
             show_threat_summary(metrics, result_df)
@@ -1052,7 +1237,9 @@ def main() -> None:
 
         if st.button("Run Threat Analysis", type="primary"):
             result_df, metrics = show_loading_and_predict(uploaded_df, model, label_encoder)
+            save_prediction_logs(result_df, metrics, source="threat_analysis_upload")
             styled_metrics_cards(metrics, detection_accuracy)
+            show_saved_log_paths()
             show_realtime_alert_banner(metrics)
             show_charts(result_df, metrics)
             alerts = build_realtime_alert_center(result_df, metrics)
@@ -1071,6 +1258,7 @@ def main() -> None:
 
         if st.button("Predict Attacks", type="primary"):
             result_df, metrics = show_loading_and_predict(uploaded_df, model, label_encoder)
+            save_prediction_logs(result_df, metrics, source="predictions_upload")
 
             # Search/filter UI
             filtered_df = filter_predictions(result_df)
@@ -1084,6 +1272,24 @@ def main() -> None:
             st.write(f"Total analyzed records: {metrics['total_traffic']}")
             st.write(f"Malicious records: {metrics['malicious_count']}")
             st.write(f"Threat severity: {metrics['threat_severity']}")
+            show_saved_log_paths()
+
+    elif page == "Manual Prediction":
+        model, label_encoder = load_model_artifacts()
+        if model is None:
+            st.error("Model not found. Run `train_model.py` first.")
+            return
+
+        manual_df = render_manual_input_section()
+        if st.button("Analyze Manual Traffic", type="primary"):
+            result_df, metrics = show_loading_and_predict(manual_df, model, label_encoder)
+            save_prediction_logs(result_df, metrics, source="manual_input")
+            styled_metrics_cards(metrics, load_detection_accuracy())
+            show_realtime_alert_banner(metrics)
+            st.subheader("Manual Prediction Result")
+            st.dataframe(result_df, use_container_width=True)
+            show_confidence_summary(result_df)
+            show_saved_log_paths()
 
     elif page == "Visualizations":
         model, label_encoder = load_model_artifacts()
@@ -1098,6 +1304,8 @@ def main() -> None:
 
         if st.button("Generate Analytics", type="primary"):
             result_df, metrics = show_loading_and_predict(uploaded_df, model, label_encoder)
+            save_prediction_logs(result_df, metrics, source="visualizations_upload")
+            show_saved_log_paths()
             show_charts(result_df, metrics)
 
     elif page == "Reports":
@@ -1114,8 +1322,10 @@ def main() -> None:
 
         if st.button("Create Threat Report", type="primary"):
             result_df, metrics = show_loading_and_predict(uploaded_df, model, label_encoder)
+            save_prediction_logs(result_df, metrics, source="reports_upload")
             st.subheader("Threat Report (Summary)")
             styled_metrics_cards(metrics, load_detection_accuracy())
+            show_saved_log_paths()
             show_realtime_alert_banner(metrics)
 
             malicious_df = result_df[result_df["prediction_result"] == "malicious"]
